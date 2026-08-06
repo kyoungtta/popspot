@@ -5,14 +5,16 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,6 +37,16 @@ import lombok.extern.slf4j.Slf4j;
 public class WaitingQueueRedisService {
 
 	private static final String CB_NAME = "waitingQueueRedis";
+
+	// 스크립트 본문이 고정이므로 주입 대신 static 보유 (생성자 시그니처 유지)
+	private static final DefaultRedisScript<List> ACTIVE_POPUPS_SWEEP_SCRIPT = activePopupsSweepScript();
+
+	private static DefaultRedisScript<List> activePopupsSweepScript() {
+		DefaultRedisScript<List> script = new DefaultRedisScript<>();
+		script.setLocation(new ClassPathResource("redis/active-popups-sweep.lua"));
+		script.setResultType(List.class);
+		return script;
+	}
 
 	private final StringRedisTemplate redisTemplate;
 	private final WaitingQueueProperties properties;
@@ -149,25 +161,29 @@ public class WaitingQueueRedisService {
 		redisTemplate.delete(RedisKeys.popupProceedFlag(popupId, userId));
 	}
 
+	/**
+	 * 활성 대기열 팝업 인덱스를 스윕해 ZSET이 살아있는 popupId만 반환한다.
+	 *
+	 * <p>SMEMBERS + EXISTS + SREM을 Lua로 원자 실행한다. EXISTS(없음) 확인과 SREM 사이에
+	 * enqueue(ZADD + SADD)가 끼어 방금 들어온 팝업이 인덱스에서 지워지는 race를 막는다.
+	 * 그 팝업에 신규 enqueue가 더 없으면 인덱스를 되살릴 트리거가 없어 스케줄러가 영영
+	 * admitBatch 대상에서 제외하므로, 대기자 전원이 멈추는 손실로 이어진다.
+	 *
+	 * <p>주의: 스크립트 실행 동안 Redis 전체가 블로킹된다. 루프가 활성 팝업 수 N에
+	 * 비례하므로 현재 규모에서는 무시 가능하지만, N이 커지면 SSCAN 커서 기반으로
+	 * 나눠 돌리거나 인덱스를 샤딩해 배치 분할 호출로 바꿔야 한다.
+	 * Cluster 전환 시 제약은 {@code redis/active-popups-sweep.lua} 주석 참고.
+	 */
+	@SuppressWarnings("unchecked")
 	public Set<Long> getActivePopupIds() {
-		Set<String> ids = redisTemplate.opsForSet().members(RedisKeys.activeWaitingPopups());
-		if (ids == null || ids.isEmpty()) {
+		List<String> alive = redisTemplate.execute(
+			ACTIVE_POPUPS_SWEEP_SCRIPT,
+			List.of(RedisKeys.activeWaitingPopups()),
+			RedisKeys.popupWaitingQueuePrefix()
+		);
+		if (alive == null || alive.isEmpty()) {
 			return Collections.emptySet();
 		}
-		Set<Long> active = new HashSet<>();
-		for (String id : ids) {
-			long popupId = Long.parseLong(id);
-			if (Boolean.TRUE.equals(redisTemplate.hasKey(RedisKeys.popupWaitingQueue(popupId)))) {
-				active.add(popupId);                          // ZSET 살아있음 → 활성 대기열
-			} else {
-				// ZSET 없음(대기열 소진/TTL 만료) → Set에서 lazy 청소
-				// 주의: hasKey(없음) 확인 후 SREM 사이에 enqueue가 끼면
-				// 방금 들어온 팝업을 뺄 수 있음. 다음 조회/enqueue에서 자연 복원되므로
-				// 유저 누락으로 이어지진 않음. 완전 보장은 Lua 원자화(추후 과제).
-				redisTemplate.opsForSet().remove(RedisKeys.activeWaitingPopups(), id);
-			}
-		}
-		return active;
-
+		return alive.stream().map(Long::parseLong).collect(Collectors.toSet());
 	}
 }
