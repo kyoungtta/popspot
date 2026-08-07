@@ -1,9 +1,11 @@
 package com.back.popspot.domain.reservation.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -16,6 +18,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -34,7 +37,12 @@ import com.back.popspot.domain.reservation.dto.ReservationCapacityRebuildResult;
 import com.back.popspot.domain.reservation.entity.ReservationStatus;
 import com.back.popspot.domain.reservation.repository.ReservationCancelPoolRepository;
 import com.back.popspot.domain.reservation.repository.ReservationRepository;
+import com.back.popspot.global.exception.BusinessException;
+import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 @ExtendWith(MockitoExtension.class)
 class ReservationCapacityRebuildServiceTest {
@@ -56,8 +64,22 @@ class ReservationCapacityRebuildServiceTest {
 	@Mock
 	private ValueOperations<String, Long> valueOperations;
 
+	@Mock
+	private RebuildGate rebuildGate;
+
 	@InjectMocks
 	private ReservationCapacityRebuildService service;
+
+	/** 게이트 임대 해제가 실제로 불렸는지 보기 위한 기록용 releaser */
+	private final RecordingReleaser releaser = new RecordingReleaser();
+
+	@BeforeEach
+	void stubGate() {
+		lenient().when(rebuildGate.tryBegin(any())).thenAnswer(invocation -> {
+			RebuildScope scope = invocation.getArgument(0);
+			return Optional.of(new RebuildLease(scope, "test-token", releaser));
+		});
+	}
 
 	@Test
 	@DisplayName("Redis 재구축 시 미공개 취소 예약 pendingCount를 차감한다")
@@ -153,6 +175,45 @@ class ReservationCapacityRebuildServiceTest {
 	}
 
 	// findByIdWithPopupStore / count / pending / opsForValue 를 한 번에 스텁한다.
+	@Test
+	@DisplayName("재구축 전에 게이트를 잡고, 끝나면 임대를 해제한다")
+	void rebuildSlotRemaining_acquiresAndReleasesGate() {
+		ReservationSlot slot = slot(SLOT_ID, 10, LocalDateTime.now().plusDays(2));
+		stubCommon(slot, 4L, 2L);
+
+		service.rebuildSlotRemaining(SLOT_ID);
+
+		verify(rebuildGate).tryBegin(RebuildScope.reservationSlot(SLOT_ID));
+		assertThat(releaser.released).as("임대가 해제돼야 한다").isTrue();
+	}
+
+	@Test
+	@DisplayName("다른 인스턴스가 이미 재구축 중이면 DB를 읽지 않고 409로 물러난다")
+	void rebuildSlotRemaining_whenGateTaken_throwsAndSkipsDbRead() {
+		when(rebuildGate.tryBegin(any())).thenReturn(Optional.empty());
+
+		assertThatThrownBy(() -> service.rebuildSlotRemaining(SLOT_ID))
+			.isInstanceOf(BusinessException.class)
+			.extracting(e -> ((BusinessException)e).getErrorCode())
+			.isEqualTo(ErrorCode.REBUILD_ALREADY_IN_PROGRESS);
+
+		verify(reservationSlotRepository, never()).findByIdWithPopupStore(any());
+	}
+
+	private static final class RecordingReleaser implements RebuildLease.Releaser {
+		private boolean released;
+
+		@Override
+		public void release(RebuildScope scope, String token) {
+			released = true;
+		}
+
+		@Override
+		public boolean renew(RebuildScope scope, String token) {
+			return true;
+		}
+	}
+
 	private void stubCommon(ReservationSlot slot, long activeCount, long pendingCount) {
 		when(reservationSlotRepository.findByIdWithPopupStore(SLOT_ID)).thenReturn(Optional.of(slot));
 		when(reservationRepository.countBySlotIdAndStatusIn(

@@ -13,6 +13,8 @@ import com.back.popspot.domain.popupStore.entity.PopupStore;
 import com.back.popspot.domain.popupStore.repository.PopupStoreRepository;
 import com.back.popspot.global.queue.exception.QueueCircuitOpenException;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 import com.back.popspot.global.response.CommonApiResponse;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -29,6 +31,7 @@ public class WaitingQueueInterceptor implements HandlerInterceptor {
 	private final WaitingQueueRedisService queueService;
 	private final ObjectMapper objectMapper;
 	private final PopupStoreRepository popupStoreRepository;
+	private final RebuildGate rebuildGate;
 
 	@Override
 	public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler)
@@ -50,7 +53,12 @@ public class WaitingQueueInterceptor implements HandlerInterceptor {
 			return true;
 		}
 
-		if (queueService.isRecovering()) {
+		// 두 게이트는 서로 다른 실패 모드를 담당한다.
+		//   isRecovering()  — 인스턴스 로컬. Redis 장애 복구 중에도 살아있어야 하므로 in-memory.
+		//   isRebuilding()  — Redis 공유. 다른 인스턴스가 이 팝업 대기열을 재구축 중인 경우.
+		// 남는 창: 이 검사와 enqueue 사이. enqueue는 중간에 DB 쓰기가 있어 Lua로 묶을 수 없다.
+		// 그 사이 유실된 대기자는 DB를 source of truth로 삼는 다음 recover에서 복원된다.
+		if (queueService.isRecovering() || rebuildGate.isRebuilding(RebuildScope.popupQueue(popupId))) {
 			writeServiceUnavailableResponse(response);
 			return false;
 		}

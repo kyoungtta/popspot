@@ -2,12 +2,15 @@ package com.back.popspot.domain.reservation.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+
+import java.util.List;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -21,8 +24,10 @@ import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
+import com.back.popspot.domain.reservation.dto.SlotDecrementResult;
 import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 
@@ -55,6 +60,7 @@ import io.github.resilience4j.springboot3.circuitbreaker.autoconfigure.CircuitBr
 class ReservationRedisServiceCircuitBreakerTest {
 
 	private static final String KEY = "popspot:reservation:slot:1:remaining";
+	private static final String GATE_KEY = "rebuild:reservation:slot:1";
 	private static final String CB_NAME = "redisReservation";
 	// minimum-number-of-calls=4, failure-rate=50% → 연속 4회 실패면 OPEN
 	private static final int CALLS_TO_TRIP = 4;
@@ -87,11 +93,11 @@ class ReservationRedisServiceCircuitBreakerTest {
 	}
 
 	@Test
-	@DisplayName("decrement: Redis 장애가 나면 fallback 이 RESERVATION_TEMPORARILY_UNAVAILABLE 예외를 던진다")
+	@DisplayName("decrementUnlessRebuilding: Redis 장애가 나면 fallback 이 RESERVATION_TEMPORARILY_UNAVAILABLE 예외를 던진다")
 	void decrement_redisFailure_throwsTemporarilyUnavailable() {
-		when(valueOperations.decrement(KEY)).thenThrow(new RedisConnectionFailureException("redis down"));
+		givenScriptFails();
 
-		assertThatThrownBy(() -> reservationRedisService.decrement(KEY))
+		assertThatThrownBy(() -> reservationRedisService.decrementUnlessRebuilding(KEY, GATE_KEY))
 			.isInstanceOf(BusinessException.class)
 			.extracting(e -> ((BusinessException)e).getErrorCode())
 			.isEqualTo(ErrorCode.RESERVATION_TEMPORARILY_UNAVAILABLE);
@@ -110,11 +116,11 @@ class ReservationRedisServiceCircuitBreakerTest {
 	@Test
 	@DisplayName("서킷이 OPEN 되면 Redis 연결을 시도하지 않고 즉시 fallback 으로 차단한다")
 	void decrement_whenCircuitOpen_doesNotCallRedis() {
-		when(valueOperations.decrement(KEY)).thenThrow(new RedisConnectionFailureException("redis down"));
+		givenScriptFails();
 
 		// 1) 연속 실패로 서킷을 OPEN 으로 만든다.
 		for (int i = 0; i < CALLS_TO_TRIP; i++) {
-			assertThatThrownBy(() -> reservationRedisService.decrement(KEY))
+			assertThatThrownBy(() -> reservationRedisService.decrementUnlessRebuilding(KEY, GATE_KEY))
 				.isInstanceOf(BusinessException.class);
 		}
 
@@ -122,14 +128,48 @@ class ReservationRedisServiceCircuitBreakerTest {
 		assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
 
 		// 2) 지금까지의 Redis 호출 기록을 비우고, OPEN 상태에서 한 번 더 호출한다.
-		clearInvocations(valueOperations);
+		clearInvocations(redisTemplate);
 
-		assertThatThrownBy(() -> reservationRedisService.decrement(KEY))
+		assertThatThrownBy(() -> reservationRedisService.decrementUnlessRebuilding(KEY, GATE_KEY))
 			.isInstanceOf(BusinessException.class)
 			.extracting(e -> ((BusinessException)e).getErrorCode())
 			.isEqualTo(ErrorCode.RESERVATION_TEMPORARILY_UNAVAILABLE);
 
 		// 3) OPEN 이면 메서드 본문(=Redis 접근)이 실행되지 않아야 한다.
-		verify(valueOperations, never()).decrement(anyString());
+		verify(redisTemplate, never()).execute(any(RedisScript.class), anyList());
+	}
+
+	@Test
+	@DisplayName("재구축 중이면 차감하지 않고 rebuilding=true 를 반환한다 (서킷은 실패로 기록하지 않음)")
+	@SuppressWarnings("unchecked")
+	void decrement_whenRebuilding_returnsRebuildingWithoutTrippingCircuit() {
+		// Lua가 {0} 을 돌려주는 상황 = 게이트가 잡혀 있어 차감을 건너뛴 경우
+		when(redisTemplate.execute(any(RedisScript.class), anyList())).thenReturn(List.of(0L));
+
+		SlotDecrementResult result = reservationRedisService.decrementUnlessRebuilding(KEY, GATE_KEY);
+
+		assertThat(result.rebuilding()).isTrue();
+		assertThat(result.remaining()).isNull();
+		// 재구축은 Redis 장애가 아니므로 서킷이 열려서는 안 된다
+		assertThat(circuitBreakerRegistry.circuitBreaker(CB_NAME).getState())
+			.isEqualTo(CircuitBreaker.State.CLOSED);
+	}
+
+	@Test
+	@DisplayName("재구축 중이 아니면 DECR 결과를 그대로 돌려준다")
+	@SuppressWarnings("unchecked")
+	void decrement_whenNotRebuilding_returnsRemaining() {
+		when(redisTemplate.execute(any(RedisScript.class), anyList())).thenReturn(List.of(1L, 9L));
+
+		SlotDecrementResult result = reservationRedisService.decrementUnlessRebuilding(KEY, GATE_KEY);
+
+		assertThat(result.rebuilding()).isFalse();
+		assertThat(result.remaining()).isEqualTo(9L);
+	}
+
+	@SuppressWarnings("unchecked")
+	private void givenScriptFails() {
+		when(redisTemplate.execute(any(RedisScript.class), anyList()))
+			.thenThrow(new RedisConnectionFailureException("redis down"));
 	}
 }

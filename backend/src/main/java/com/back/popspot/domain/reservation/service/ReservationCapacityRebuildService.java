@@ -18,6 +18,9 @@ import com.back.popspot.domain.reservation.repository.ReservationRepository;
 import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -36,9 +39,23 @@ public class ReservationCapacityRebuildService {
 	private final ReservationRepository reservationRepository;
 	private final ReservationCancelPoolRepository reservationCancelPoolRepository;
 	private final RedisTemplate<String, Long> redisTemplate;
+	private final RebuildGate rebuildGate;
 
 	@Transactional(readOnly = true)
 	public ReservationCapacityRebuildResult rebuildSlotRemaining(Long slotId) {
+		RebuildScope scope = RebuildScope.reservationSlot(slotId);
+
+		// 게이트는 반드시 아래 어떤 repository 호출보다 먼저 잡아야 한다.
+		// DB 읽기가 시작된 뒤에 잡으면, 읽은 값과 게이트 사이에 들어온 DECR이 그대로 덮어써진다.
+		// (InnoDB의 consistent read 스냅샷은 BEGIN이 아니라 첫 SELECT에서 잡히므로,
+		//  트랜잭션 안이라도 첫 문장이면 안전하다.)
+		try (RebuildLease ignored = rebuildGate.tryBegin(scope)
+			.orElseThrow(() -> new BusinessException(ErrorCode.REBUILD_ALREADY_IN_PROGRESS))) {
+			return doRebuild(slotId);
+		}
+	}
+
+	private ReservationCapacityRebuildResult doRebuild(Long slotId) {
 		// 복구할 슬롯이 실제로 존재하는지 먼저 확인한다.
 		ReservationSlot slot = reservationSlotRepository.findByIdWithPopupStore(slotId)
 			.orElseThrow(() -> new BusinessException(ErrorCode.RESERVATION_SLOT_NOT_FOUND));

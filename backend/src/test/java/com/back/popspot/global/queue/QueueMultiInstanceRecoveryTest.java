@@ -60,6 +60,8 @@ import com.back.popspot.global.queue.config.WaitingQueueProperties;
 import com.back.popspot.global.queue.interceptor.WaitingQueueInterceptor;
 import com.back.popspot.global.queue.service.QueueRecoveryCoordinator;
 import com.back.popspot.global.queue.service.QueueRecoveryService;
+import com.back.popspot.global.redis.rebuild.RebuildProperties;
+import com.back.popspot.global.redis.rebuild.RedisRebuildGate;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
 import com.back.popspot.global.redis.RedisKeys;
 
@@ -104,6 +106,7 @@ class QueueMultiInstanceRecoveryTest {
     @Configuration
     @Import({
         QueueRecoveryService.class,
+        RedisRebuildGate.class,
         SchedulerLockConfig.class
     })
     @ImportAutoConfiguration({
@@ -114,7 +117,9 @@ class QueueMultiInstanceRecoveryTest {
         DataJpaRepositoriesAutoConfiguration.class,
         TransactionAutoConfiguration.class
     })
-    @EnableConfigurationProperties({WaitingQueueProperties.class, QueueRecoveryProperties.class})
+    @EnableConfigurationProperties({
+        WaitingQueueProperties.class, QueueRecoveryProperties.class, RebuildProperties.class
+    })
     @EntityScan(basePackages = "com.back.popspot")
     @EnableJpaRepositories(basePackages = "com.back.popspot")
     static class TestConfig {}
@@ -152,6 +157,7 @@ class QueueMultiInstanceRecoveryTest {
     @Autowired PopupQueueEntryRepository queueEntryRepository;
     @Autowired PopupStoreRepository popupStoreRepository;
     @Autowired UserRepository userRepository;
+    @Autowired RedisRebuildGate rebuildGate;
 
     // ── 인스턴스별 독립 Bean (recovering AtomicBoolean 분리) ──────────────────
 
@@ -391,9 +397,9 @@ class QueueMultiInstanceRecoveryTest {
         // 인터셉터는 Spring Bean이 아닌 원칙으로 수동 생성
         // hasProceedPermission·enqueue는 CB 프록시 없이 Redis 직접 호출 (이 TC에서는 무방)
         WaitingQueueInterceptor interceptorA =
-            new WaitingQueueInterceptor(serviceA, new ObjectMapper(), popupStoreRepository);
+            new WaitingQueueInterceptor(serviceA, new ObjectMapper(), popupStoreRepository, rebuildGate);
         WaitingQueueInterceptor interceptorB =
-            new WaitingQueueInterceptor(serviceB, new ObjectMapper(), popupStoreRepository);
+            new WaitingQueueInterceptor(serviceB, new ObjectMapper(), popupStoreRepository, rebuildGate);
 
         MockHttpServletRequest req = new MockHttpServletRequest("GET", "/popups/" + popupId);
 
