@@ -21,6 +21,7 @@ import com.back.popspot.domain.popupStore.entity.PopupFeeType;
 import com.back.popspot.domain.popupStore.entity.PopupStore;
 import com.back.popspot.domain.popupStore.entity.ReservationSlot;
 import com.back.popspot.domain.popupStore.repository.ReservationSlotRepository;
+import com.back.popspot.domain.reservation.dto.SlotDecrementResult;
 import com.back.popspot.domain.reservation.dto.request.ReservationCreateRequest;
 import com.back.popspot.domain.reservation.dto.request.ReservationPaymentRequest;
 import com.back.popspot.domain.reservation.dto.response.MyReservationResponse;
@@ -36,6 +37,7 @@ import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.exception.ReservationPaymentExpiredException;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -117,7 +119,17 @@ public class ReservationService {
 		String remainingKey = RedisKeys.reservationSlotRemaining(slotId);
 
 		// 2. 모든 검증 통과 후 단일 카운터(remaining) 선차감. DECR 반환값만으로 동시성 제어가 완결된다.
-		Long after = reservationRedisService.decrement(remainingKey);
+		//    재구축 중이면 차감 자체가 이뤄지지 않는다 — 차감해봐야 blind write에 덮어써지므로
+		//    과다판매만 남는다. 롤백할 것도 없이 곧바로 503.
+		SlotDecrementResult decrement = reservationRedisService.decrementUnlessRebuilding(
+			remainingKey,
+			RebuildScope.reservationSlot(slotId).key()
+		);
+		if (decrement.rebuilding()) {
+			throw new BusinessException(ErrorCode.RESERVATION_TEMPORARILY_UNAVAILABLE);
+		}
+
+		Long after = decrement.remaining();
 		if (after == null || after < 0) {
 			// 남은 자리 없음/미초기화 → remaining 롤백
 			reservationRedisService.increment(remainingKey);

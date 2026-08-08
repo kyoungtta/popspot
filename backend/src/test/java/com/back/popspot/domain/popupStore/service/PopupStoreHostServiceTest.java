@@ -38,6 +38,9 @@ import com.back.popspot.domain.user.entity.User;
 import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 import com.back.popspot.global.s3.S3Service;
 
 import jakarta.persistence.EntityManager;
@@ -47,6 +50,17 @@ import jakarta.persistence.EntityManager;
  */
 @ExtendWith(MockitoExtension.class)
 class PopupStoreHostServiceTest {
+
+	private static final RebuildLease.Releaser NOOP_RELEASER = new RebuildLease.Releaser() {
+		@Override
+		public void release(RebuildScope scope, String token) {
+		}
+
+		@Override
+		public boolean renew(RebuildScope scope, String token) {
+			return true;
+		}
+	};
 
 	@Mock
 	private PopupStoreRepository popupStoreRepository;
@@ -66,6 +80,9 @@ class PopupStoreHostServiceTest {
 	@Mock
 	private ValueOperations<String, Long> valueOperations;
 
+	@Mock
+	private RebuildGate rebuildGate;
+
 	@InjectMocks
 	private PopupStoreHostService popupStoreHostService;
 
@@ -78,6 +95,9 @@ class PopupStoreHostServiceTest {
 	void setUp() {
 		// @InjectMocks 가 생성자 주입을 택하면 @PersistenceContext 필드는 주입되지 않으므로 직접 세팅
 		ReflectionTestUtils.setField(popupStoreHostService, "entityManager", entityManager);
+		// 슬롯 카운터 초기화는 재구축 게이트를 잡은 뒤에만 실행된다
+		lenient().when(rebuildGate.tryBegin(any())).thenAnswer(invocation ->
+			Optional.of(new RebuildLease(invocation.getArgument(0), "test-token", NOOP_RELEASER)));
 	}
 
 	@Test

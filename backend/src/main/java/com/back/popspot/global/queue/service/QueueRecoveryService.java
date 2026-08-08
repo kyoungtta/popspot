@@ -17,6 +17,9 @@ import com.back.popspot.domain.queue.entity.QueueEntryStatus;
 import com.back.popspot.domain.queue.repository.PopupQueueEntryRepository;
 import com.back.popspot.global.queue.config.WaitingQueueProperties;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +33,7 @@ public class QueueRecoveryService {
 	private final StringRedisTemplate redisTemplate;
 	private final PopupStoreRepository popupStoreRepository;
 	private final WaitingQueueProperties properties;
+	private final RebuildGate rebuildGate;
 
 	public void recoverAll() {
 		LocalDateTime now = LocalDateTime.now();
@@ -39,6 +43,22 @@ public class QueueRecoveryService {
 	}
 
 	public void recover(long popupId, LocalDateTime reservationEndAt) {
+		RebuildScope scope = RebuildScope.popupQueue(popupId);
+
+		// 게이트는 DB 읽기 전에. 파이프라인의 DEL이 그 사이 enqueue된 대기자를 지우는 것을 막는다.
+		// (executePipelined는 원자적이지 않으므로 DEL~ZADD 사이도 노출 구간이다.)
+		Optional<RebuildLease> lease = rebuildGate.tryBegin(scope);
+		if (lease.isEmpty()) {
+			log.info("[QueueRecovery] popupId={} — 다른 인스턴스가 재구축 중, 스킵", popupId);
+			return;
+		}
+
+		try (RebuildLease ignored = lease.get()) {
+			doRecover(popupId, reservationEndAt);
+		}
+	}
+
+	private void doRecover(long popupId, LocalDateTime reservationEndAt) {
 		Optional<Long> maxSeq = entryRepository.findMaxSeqByPopupId(popupId);
 		if (maxSeq.isEmpty()) {
 			log.info("[QueueRecovery] popupId={} — DB에 항목 없음, 스킵", popupId);

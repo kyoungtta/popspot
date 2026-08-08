@@ -58,6 +58,8 @@ import com.back.popspot.global.queue.config.SchedulerLockConfig;
 import com.back.popspot.global.queue.config.WaitingQueueProperties;
 import com.back.popspot.global.queue.service.QueueRecoveryCoordinator;
 import com.back.popspot.global.queue.service.QueueRecoveryService;
+import com.back.popspot.global.redis.rebuild.RebuildProperties;
+import com.back.popspot.global.redis.rebuild.RedisRebuildGate;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
 import com.back.popspot.global.redis.RedisKeys;
 
@@ -127,6 +129,7 @@ class QueueFaultRecoveryIntegrationTest {
         QueueCircuitBreakerEventConfig.class,
         QueueRecoveryCoordinator.class,
         QueueRecoveryService.class,
+        RedisRebuildGate.class,
         SchedulerLockConfig.class
     })
     @ImportAutoConfiguration({
@@ -138,7 +141,9 @@ class QueueFaultRecoveryIntegrationTest {
         DataJpaRepositoriesAutoConfiguration.class,
         TransactionAutoConfiguration.class
     })
-    @EnableConfigurationProperties({WaitingQueueProperties.class, QueueRecoveryProperties.class})
+    @EnableConfigurationProperties({
+        WaitingQueueProperties.class, QueueRecoveryProperties.class, RebuildProperties.class
+    })
     @EntityScan(basePackages = "com.back.popspot")
     @EnableJpaRepositories(basePackages = "com.back.popspot")
     static class TestConfig {}

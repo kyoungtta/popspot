@@ -5,6 +5,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import org.springframework.data.redis.core.RedisTemplate;
@@ -28,6 +29,9 @@ import com.back.popspot.domain.user.entity.User;
 import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 import com.back.popspot.global.s3.S3Service;
 
 import jakarta.persistence.EntityManager;
@@ -47,6 +51,7 @@ public class PopupStoreHostService {
 	private final ReservationSlotRepository reservationSlotRepository;
 	private final S3Service s3Service;
 	private final RedisTemplate<String, Long> redisTemplate;
+	private final RebuildGate rebuildGate;
 
 	@PersistenceContext
 	private EntityManager entityManager;
@@ -321,12 +326,30 @@ public class PopupStoreHostService {
 	// 동기화가 비활성(트랜잭션 밖)이면 즉시 실행한다.
 	private void registerAfterCommitSlotCounterInit(Long slotId, int capacity, LocalDateTime closeDate) {
 		long ttlSeconds = ChronoUnit.SECONDS.between(LocalDateTime.now(),closeDate);
-		Runnable init = () -> redisTemplate.opsForValue().set(
-			RedisKeys.reservationSlotRemaining(slotId),
-			(long)capacity,
-			ttlSeconds,
-			TimeUnit.SECONDS
-		);
+		// 이 blind set은 ReservationCapacityRebuildService와 같은 키를 만지므로 같은 게이트를 쓴다.
+		// 슬롯 생성 직후라 아직 DECR을 칠 사용자는 없지만, 재구축이 도는 중이라면 그 결과를
+		// capacity로 덮어써 버리므로 게이트를 잡지 못하면 초기화를 건너뛴다.
+		// (건너뛰어도 재구축이 DB 기준으로 같은 값을 채워 넣는다.)
+		Runnable init = () -> {
+			RebuildScope scope = RebuildScope.reservationSlot(slotId);
+			Optional<RebuildLease> lease = rebuildGate.tryBegin(scope);
+			if (lease.isEmpty()) {
+				log.warn(
+					"[SLOT_COUNTER_INIT_SKIPPED] 재구축 중이라 슬롯 카운터 초기화 스킵: slotId={}, capacity={}",
+					slotId,
+					capacity
+				);
+				return;
+			}
+			try (RebuildLease ignored = lease.get()) {
+				redisTemplate.opsForValue().set(
+					RedisKeys.reservationSlotRemaining(slotId),
+					(long)capacity,
+					ttlSeconds,
+					TimeUnit.SECONDS
+				);
+			}
+		};
 		if (!TransactionSynchronizationManager.isSynchronizationActive()) {
 			init.run();
 			return;

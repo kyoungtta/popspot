@@ -29,6 +29,7 @@ import com.back.popspot.domain.popupStore.entity.PopupStore;
 import com.back.popspot.domain.popupStore.repository.PopupStoreRepository;
 import com.back.popspot.global.queue.interceptor.WaitingQueueInterceptor;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
 
 import jakarta.servlet.http.HttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
@@ -43,11 +44,14 @@ class WaitingQueueInterceptorClosedPopupTest {
     @Mock
     PopupStoreRepository popupStoreRepository;
 
+    @Mock
+    RebuildGate rebuildGate;
+
     WaitingQueueInterceptor interceptor;
 
     @BeforeEach
     void setUp() {
-        interceptor = new WaitingQueueInterceptor(queueService, new ObjectMapper(), popupStoreRepository);
+        interceptor = new WaitingQueueInterceptor(queueService, new ObjectMapper(), popupStoreRepository, rebuildGate);
         SecurityContextHolder.getContext().setAuthentication(
             new UsernamePasswordAuthenticationToken(1L, null, List.of())
         );

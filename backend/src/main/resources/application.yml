@@ -57,6 +57,11 @@ waiting-queue:
 queue-cleanup:
   chunk-size: 1000
 
+redis-rebuild:
+  # 게이트 TTL. 재구축은 슬롯/팝업 단위라 보통 수백 ms 안에 끝나므로 넉넉한 값.
+  # 재구축 중 프로세스가 죽으면 이 시간만큼 해당 키의 트래픽이 503이 된다.
+  ttl-seconds: 30
+
 queue-recovery:
   max-attempts: 60
   poll-interval-seconds: 5

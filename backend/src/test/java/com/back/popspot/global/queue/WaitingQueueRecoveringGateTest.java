@@ -30,6 +30,8 @@ import com.back.popspot.domain.popupStore.repository.PopupStoreRepository;
 import com.back.popspot.global.queue.exception.QueueCircuitOpenException;
 import com.back.popspot.global.queue.interceptor.WaitingQueueInterceptor;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 import jakarta.servlet.http.HttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
@@ -50,11 +52,14 @@ class WaitingQueueRecoveringGateTest {
     @Mock
     PopupStoreRepository popupStoreRepository;
 
+    @Mock
+    RebuildGate rebuildGate;
+
     WaitingQueueInterceptor interceptor;
 
     @BeforeEach
     void setUp() {
-        interceptor = new WaitingQueueInterceptor(queueService, new ObjectMapper(), popupStoreRepository);
+        interceptor = new WaitingQueueInterceptor(queueService, new ObjectMapper(), popupStoreRepository, rebuildGate);
         SecurityContextHolder.getContext().setAuthentication(
             new UsernamePasswordAuthenticationToken(1L, null, List.of())
         );
@@ -83,11 +88,33 @@ class WaitingQueueRecoveringGateTest {
     }
 
     @Test
+    @DisplayName("recovering=false지만 다른 인스턴스가 대기열을 재구축 중 → 503 (Redis 게이트가 차단)")
+    void rebuilding_true_차단() throws Exception {
+        given(queueService.hasProceedPermission(anyLong(), anyString())).willReturn(false);
+        given(queueService.isRecovering()).willReturn(false);
+        given(rebuildGate.isRebuilding(RebuildScope.popupQueue(1L))).willReturn(true);
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/popups/1");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        boolean result = interceptor.preHandle(request, response, new Object());
+
+        assertThat(result).isFalse();
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        assertThat(response.getHeader("Retry-After")).isEqualTo("10");
+        // 게이트가 막았으므로 DB 조회도 enqueue도 없어야 한다
+        verify(popupStoreRepository, never()).findById(anyLong());
+        verify(queueService, never()).enqueue(anyLong(), anyString(), any());
+    }
+
+    @Test
     @DisplayName("recovering=false, CB=CLOSED → 202 대기 응답 (정상 enqueue)")
     void recovering_false_cbClosed_정상통과() throws Exception {
         PopupStore popup = mock(PopupStore.class);
         given(queueService.hasProceedPermission(anyLong(), anyString())).willReturn(false);
         given(queueService.isRecovering()).willReturn(false);
+        given(rebuildGate.isRebuilding(RebuildScope.popupQueue(1L))).willReturn(false);
         given(popupStoreRepository.findById(1L)).willReturn(Optional.of(popup));
         given(popup.getReservationEndAt()).willReturn(LocalDateTime.of(2099, 12, 31, 23, 59));
 

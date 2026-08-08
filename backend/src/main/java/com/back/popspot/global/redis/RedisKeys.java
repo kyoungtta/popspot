@@ -48,4 +48,9 @@ public final class RedisKeys {
 		return "active:waiting:popups";
 	}
 
+	// DB 기준 재구축 중임을 표시하는 게이트 키. scopeName은 RebuildScope가 만든다.
+	public static String rebuildFlag(String scopeName) {
+		return "rebuild:" + scopeName;
+	}
+
 }

@@ -42,6 +42,7 @@ import com.back.popspot.domain.popupStore.entity.PopupFeeType;
 import com.back.popspot.domain.popupStore.entity.PopupStore;
 import com.back.popspot.domain.popupStore.entity.ReservationSlot;
 import com.back.popspot.domain.popupStore.repository.ReservationSlotRepository;
+import com.back.popspot.domain.reservation.dto.SlotDecrementResult;
 import com.back.popspot.domain.reservation.dto.request.ReservationCreateRequest;
 import com.back.popspot.domain.reservation.dto.request.ReservationPaymentRequest;
 import com.back.popspot.domain.reservation.dto.response.MyReservationResponse;
@@ -56,6 +57,7 @@ import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 
 @ExtendWith(MockitoExtension.class)
 class ReservationServiceTest {
@@ -209,7 +211,10 @@ class ReservationServiceTest {
 		User user = createUser(2L);
 
 		// 단일 카운터: remaining -1 → 9 (0 이상) 통과
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(9L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(9L));
 
 		when(reservationSlotRepository.findByIdWithPopupStore(1L)).thenReturn(Optional.of(slot));
 		when(waitingQueueRedisService.hasProceedPermission(1L, "2")).thenReturn(true);
@@ -249,7 +254,10 @@ class ReservationServiceTest {
 			any(LocalDateTime.class)
 		);
 		// 정상 흐름: remaining -1 만 일어나고 롤백(remaining +1)은 없어야 한다
-		verify(reservationRedisService).decrement(RedisKeys.reservationSlotRemaining(1L));
+		verify(reservationRedisService).decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		);
 		verify(reservationRedisService, never()).increment(RedisKeys.reservationSlotRemaining(1L));
 	}
 
@@ -333,7 +341,10 @@ class ReservationServiceTest {
 		User user = createUser(2L);
 
 		// remaining -1 → 9 통과했지만 DB 저장이 실패 → remaining 롤백되어야 함
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(9L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(9L));
 
 		when(reservationSlotRepository.findByIdWithPopupStore(1L)).thenReturn(Optional.of(slot));
 		when(waitingQueueRedisService.hasProceedPermission(1L, "2")).thenReturn(true);
@@ -372,7 +383,10 @@ class ReservationServiceTest {
 		when(userRepository.findById(2L)).thenReturn(Optional.of(user));
 		when(reservationRepository.existsByUserIdAndSlotIdAndActiveUniqueKeyIsNotNull(2L, 1L)).thenReturn(false);
 		// remaining -1 결과가 -1 → 재고 없음
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(-1L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(-1L));
 
 		// when
 		BusinessException exception = assertThrows(
@@ -752,7 +766,10 @@ class ReservationServiceTest {
 		when(waitingQueueRedisService.hasProceedPermission(1L, "2")).thenReturn(true);
 		when(userRepository.findById(2L)).thenReturn(Optional.of(user));
 		when(reservationRepository.existsByUserIdAndSlotIdAndActiveUniqueKeyIsNotNull(2L, 1L)).thenReturn(false);
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(9L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(9L));
 		when(reservationCommandService.save(
 			any(User.class),
 			any(ReservationSlot.class),
@@ -814,7 +831,10 @@ class ReservationServiceTest {
 		when(waitingQueueRedisService.hasProceedPermission(1L, "2")).thenReturn(true);
 		when(userRepository.findById(2L)).thenReturn(Optional.of(user));
 		when(reservationRepository.existsByUserIdAndSlotIdAndActiveUniqueKeyIsNotNull(2L, 1L)).thenReturn(false);
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(-1L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(-1L));
 
 		// when
 		BusinessException exception = assertThrows(
@@ -842,7 +862,10 @@ class ReservationServiceTest {
 		when(waitingQueueRedisService.hasProceedPermission(1L, "2")).thenReturn(true);
 		when(userRepository.findById(2L)).thenReturn(Optional.of(user));
 		when(reservationRepository.existsByUserIdAndSlotIdAndActiveUniqueKeyIsNotNull(2L, 1L)).thenReturn(false);
-		when(reservationRedisService.decrement(RedisKeys.reservationSlotRemaining(1L))).thenReturn(9L);
+		when(reservationRedisService.decrementUnlessRebuilding(
+			RedisKeys.reservationSlotRemaining(1L),
+			RebuildScope.reservationSlot(1L).key()
+		)).thenReturn(SlotDecrementResult.decremented(9L));
 		when(reservationCommandService.save(
 			any(User.class),
 			any(ReservationSlot.class),
@@ -884,7 +907,7 @@ class ReservationServiceTest {
 		// then
 		assertEquals(ErrorCode.RESERVATION_SLOT_ALREADY_STARTED, exception.getErrorCode());
 		verify(userRepository, never()).findById(any());
-		verify(reservationRedisService, never()).decrement(any());
+		verify(reservationRedisService, never()).decrementUnlessRebuilding(any(), any());
 		verify(reservationCommandService, never()).save(any(), any(), any(), any());
 	}
 
@@ -909,7 +932,7 @@ class ReservationServiceTest {
 
 		// then
 		assertEquals(ErrorCode.RESOURCE_NOT_FOUND, exception.getErrorCode());
-		verify(reservationRedisService, never()).decrement(any());
+		verify(reservationRedisService, never()).decrementUnlessRebuilding(any(), any());
 		verify(reservationCommandService, never()).save(any(), any(), any(), any());
 	}
 
