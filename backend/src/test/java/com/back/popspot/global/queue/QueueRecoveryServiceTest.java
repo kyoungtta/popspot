@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -22,6 +24,9 @@ import com.back.popspot.global.queue.scheduler.WaitingQueueScheduler;
 import com.back.popspot.global.queue.service.QueueRecoveryService;
 import com.back.popspot.global.queue.service.WaitingQueueRedisService;
 import com.back.popspot.global.redis.RedisKeys;
+import com.back.popspot.global.redis.rebuild.RebuildGate;
+import com.back.popspot.global.redis.rebuild.RebuildLease;
+import com.back.popspot.global.redis.rebuild.RebuildScope;
 import com.back.popspot.support.ContainerIntegrationTestSupport;
 
 import net.javacrumbs.shedlock.core.LockConfiguration;
@@ -56,11 +61,16 @@ class QueueRecoveryServiceTest extends ContainerIntegrationTestSupport {
     @Autowired
     private StringRedisTemplate redisTemplate;
 
+    @Autowired
+    private RebuildGate rebuildGate;
+
     @AfterEach
     void tearDownRedis() {
         for (long id : new long[]{POPUP_A, POPUP_B, POPUP_C, POPUP_D}) {
             redisTemplate.delete(RedisKeys.popupWaitingQueue(id));
             redisTemplate.delete(RedisKeys.popupQueueSeq(id));
+            // 재구축 게이트 잔여물 제거 — 남으면 다음 테스트의 recover()가 "재구축 중"으로 스킵된다
+            redisTemplate.delete(RebuildScope.popupQueue(id).key());
             Set<String> proceedKeys = redisTemplate.keys(RedisKeys.popupProceedFlagPattern(id));
             if (proceedKeys != null && !proceedKeys.isEmpty()) {
                 redisTemplate.delete(proceedKeys);
@@ -158,6 +168,114 @@ class QueueRecoveryServiceTest extends ContainerIntegrationTestSupport {
         // then — TTL: INCR/ZADD는 TTL을 초기화하지 않으므로 recover()가 설정한 TTL이 유지됨
         assertThat(redisTemplate.getExpire(RedisKeys.popupWaitingQueue(POPUP_C))).isGreaterThan(0L);
         assertThat(redisTemplate.getExpire(RedisKeys.popupQueueSeq(POPUP_C))).isGreaterThan(0L);
+    }
+
+    // ── 게이트 계층 ───────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("게이트가 이미 잡혀 있으면 recover()는 DB도 Redis도 건드리지 않고 스킵한다")
+    void recover_게이트_선점시_스킵() {
+        // given — DB에는 복구할 WAITING 행이 있지만, 다른 인스턴스가 이미 이 팝업을 재구축 중
+        entryRepository.save(PopupQueueEntry.waiting(1L, POPUP_A, 1L));
+        RebuildLease heldByOther = rebuildGate.tryBegin(RebuildScope.popupQueue(POPUP_A)).orElseThrow();
+
+        try {
+            // when
+            recoveryService.recover(POPUP_A, FAR_FUTURE);
+
+            // then — 게이트가 recover() 진입부에서 막으므로 Lua 스크립트까지 가지 않는다.
+            // 게이트가 doRecover() 안쪽으로 내려가거나 사라지면 이 단정이 깨진다.
+            assertThat(redisTemplate.hasKey(RedisKeys.popupWaitingQueue(POPUP_A))).isFalse();
+            assertThat(redisTemplate.hasKey(RedisKeys.popupQueueSeq(POPUP_A))).isFalse();
+        } finally {
+            heldByOther.close();
+        }
+    }
+
+    @Test
+    @DisplayName("재구축이 끝나면 게이트가 풀려 다음 recover()가 정상 동작한다")
+    void recover_종료후_게이트_해제() {
+        entryRepository.save(PopupQueueEntry.waiting(1L, POPUP_A, 1L));
+
+        recoveryService.recover(POPUP_A, FAR_FUTURE);
+
+        assertThat(rebuildGate.isRebuilding(RebuildScope.popupQueue(POPUP_A)))
+            .as("try-with-resources로 임대가 닫혀야 한다")
+            .isFalse();
+        // 연속 호출이 스킵되지 않고 다시 복구된다
+        redisTemplate.delete(RedisKeys.popupWaitingQueue(POPUP_A));
+        recoveryService.recover(POPUP_A, FAR_FUTURE);
+        assertThat(redisTemplate.opsForZSet().size(RedisKeys.popupWaitingQueue(POPUP_A))).isEqualTo(1L);
+    }
+
+    // ── ZADD 청크 경계 ────────────────────────────────────────────────────────
+
+    /**
+     * 스크립트의 ZADD 청크 크기(500쌍)를 여러 번 넘기는 규모.
+     *
+     * <p>4000쌍을 넘겨야 의미가 있다 — Lua unpack()의 LUAI_MAXCSTACK(8000) 한계 때문에
+     * 청크 없이 한 번에 펼치는 구현이라면 "too many results to unpack"으로 실패한다.
+     * 청크 로직이 사라지면 이 테스트가 잡아낸다.
+     */
+    private static final int LARGE_WAITING_COUNT = 4500;
+
+    @Test
+    @DisplayName("WAITING이 ZADD 청크 크기를 여러 배 넘겨도 전원 복원된다 (Lua unpack 한계 회귀)")
+    void recover_대량_WAITING_전원_복원() {
+        // given — WAITING 4500건 (userId = seq = 1..4500)
+        List<PopupQueueEntry> entries = new ArrayList<>(LARGE_WAITING_COUNT);
+        for (int i = 1; i <= LARGE_WAITING_COUNT; i++) {
+            entries.add(PopupQueueEntry.waiting((long) i, POPUP_D, (long) i));
+        }
+        entryRepository.saveAll(entries);
+
+        // when
+        recoveryService.recover(POPUP_D, FAR_FUTURE);
+
+        // then — 전원 복원, 청크 경계 앞뒤 score가 seq와 일치
+        String zsetKey = RedisKeys.popupWaitingQueue(POPUP_D);
+        assertThat(redisTemplate.opsForZSet().size(zsetKey))
+            .as("청크로 나눠 ZADD해도 한 명도 빠지지 않아야 한다")
+            .isEqualTo((long) LARGE_WAITING_COUNT);
+
+        for (int boundary : new int[]{1, 500, 501, 1000, 1001, 2500, 4000, 4001, LARGE_WAITING_COUNT}) {
+            assertThat(redisTemplate.opsForZSet().score(zsetKey, String.valueOf(boundary)))
+                .as("userId=%d의 score는 seq와 같아야 한다", boundary)
+                .isEqualTo((double) boundary);
+        }
+
+        // then — seq 카운터와 TTL도 함께 적용된다 (같은 스크립트 안)
+        assertThat(redisTemplate.opsForValue().get(RedisKeys.popupQueueSeq(POPUP_D)))
+            .isEqualTo(String.valueOf(LARGE_WAITING_COUNT));
+        assertThat(redisTemplate.getExpire(zsetKey)).isGreaterThan(0L);
+        assertThat(redisTemplate.getExpire(RedisKeys.popupQueueSeq(POPUP_D))).isGreaterThan(0L);
+    }
+
+    // ── 재구축 전 잔여물 제거 ──────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("재구축 전 Redis에 남아있던 유령 멤버와 낡은 seq는 같은 스크립트에서 제거된다")
+    void recover_기존_Redis_잔여물_제거() {
+        // given — DB에 없는 유령 멤버와, MAX보다 큰 낡은 seq를 Redis에 심어둔다
+        String zsetKey = RedisKeys.popupWaitingQueue(POPUP_A);
+        String seqKey = RedisKeys.popupQueueSeq(POPUP_A);
+        redisTemplate.opsForZSet().add(zsetKey, "9999", 1.0);
+        redisTemplate.opsForValue().set(seqKey, "12345");
+
+        entryRepository.save(PopupQueueEntry.waiting(1L, POPUP_A, 1L));
+        entryRepository.save(PopupQueueEntry.waiting(2L, POPUP_A, 2L));
+
+        // when
+        recoveryService.recover(POPUP_A, FAR_FUTURE);
+
+        // then — DEL이 스크립트 안에서 선행되므로 유령 멤버는 남지 않는다
+        assertThat(redisTemplate.opsForZSet().score(zsetKey, "9999"))
+            .as("DB에 없는 유령 멤버는 제거돼야 한다")
+            .isNull();
+        assertThat(redisTemplate.opsForZSet().size(zsetKey)).isEqualTo(2L);
+        assertThat(redisTemplate.opsForValue().get(seqKey))
+            .as("낡은 seq는 DB MAX로 덮어써져야 한다")
+            .isEqualTo("2");
     }
 
     // ── TTL 공백 버그 증명 ─────────────────────────────────────────────────────
