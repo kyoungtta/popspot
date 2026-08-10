@@ -1,6 +1,7 @@
 # PopSpot 🎪
 
 > 팝업스토어 예약 플랫폼 — 기다림은 줄이고, 방문 경험은 더 확실하게
+> 
 > NBE9-11 팀 프로젝트를 개인적으로 확장한 버전입니다.
 > 원본: https://github.com/prgrms-be-devcourse/NBE9-11-final-Team07
 
