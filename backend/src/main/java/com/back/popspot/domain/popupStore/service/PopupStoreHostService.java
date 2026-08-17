@@ -11,8 +11,6 @@ import java.util.concurrent.TimeUnit;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import com.back.popspot.domain.popupStore.dto.PopupStoreCreateRequest;
 import com.back.popspot.domain.popupStore.dto.PopupStoreListResponse;
@@ -32,7 +30,9 @@ import com.back.popspot.global.redis.RedisKeys;
 import com.back.popspot.global.redis.rebuild.RebuildGate;
 import com.back.popspot.global.redis.rebuild.RebuildLease;
 import com.back.popspot.global.redis.rebuild.RebuildScope;
+import com.back.popspot.global.s3.S3AfterCommitExecutor;
 import com.back.popspot.global.s3.S3Service;
+import com.back.popspot.global.transaction.AfterCommitExecutor;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -52,6 +52,8 @@ public class PopupStoreHostService {
 	private final S3Service s3Service;
 	private final RedisTemplate<String, Long> redisTemplate;
 	private final RebuildGate rebuildGate;
+	private final AfterCommitExecutor afterCommitExecutor;
+	private final S3AfterCommitExecutor s3AfterCommitExecutor;
 
 	@PersistenceContext
 	private EntityManager entityManager;
@@ -94,7 +96,7 @@ public class PopupStoreHostService {
 			String srcKey = popupStore.getImageKey();
 			String destKey = buildPopupImageKey(popupStore.getId(), popupStore.getImageKey());
 			popupStore.updateImageKey(destKey);
-			registerAfterCommitMove(srcKey, destKey);
+			s3AfterCommitExecutor.moveAfterCommit(srcKey, destKey);
 		}
 
 		return popupStore.getId();
@@ -164,10 +166,10 @@ public class PopupStoreHostService {
 		}
 		if (s3Service.isTempKey(request.imageKey())) {
 			// 기존 이미지는 커밋 성공 후 삭제, 새 임시 이미지는 정식 위치로 이동
-			registerAfterCommitDeletion(popupStore.getImageKey());
+			s3AfterCommitExecutor.deleteAfterCommit(popupStore.getImageKey());
 			String destKey = buildPopupImageKey(popupStoreId, request.imageKey());
 			popupStore.updateImageKey(destKey);
-			registerAfterCommitMove(request.imageKey(), destKey);
+			s3AfterCommitExecutor.moveAfterCommit(request.imageKey(), destKey);
 		} else if (request.imageKey() != null) {
 			popupStore.updateImageKey(request.imageKey());
 		}
@@ -199,7 +201,7 @@ public class PopupStoreHostService {
 		reservationSlotRepository.deleteByPopupStoreId(popupStoreId);
 
 		// S3 이미지는 커밋 성공 후 삭제 (DB 롤백 시 파일 유실 방지)
-		registerAfterCommitDeletion(popupStore.getImageKey());
+		s3AfterCommitExecutor.deleteAfterCommit(popupStore.getImageKey());
 
 		popupStoreRepository.delete(popupStore);
 	}
@@ -322,15 +324,15 @@ public class PopupStoreHostService {
 		return imageKey != null ? s3Service.generatePresignedGetUrl(imageKey) : null;
 	}
 
-	// 트랜잭션 커밋 성공 후에 슬롯 재고 카운터를 초기화한다. (remaining=capacity)
-	// 동기화가 비활성(트랜잭션 밖)이면 즉시 실행한다.
+	// 슬롯 재고 카운터 초기화(remaining=capacity)는 커밋 성공 후에 실행한다.
+	// S3와 달리 재시도를 넣지 않는다 — 실패해도 ReservationCapacityRebuildService가
+	// DB를 기준으로 수렴시키는 복구 경로가 있다.
 	private void registerAfterCommitSlotCounterInit(Long slotId, int capacity, LocalDateTime closeDate) {
-		long ttlSeconds = ChronoUnit.SECONDS.between(LocalDateTime.now(),closeDate);
+		long ttlSeconds = ChronoUnit.SECONDS.between(LocalDateTime.now(), closeDate);
 		// 이 blind set은 ReservationCapacityRebuildService와 같은 키를 만지므로 같은 게이트를 쓴다.
 		// 슬롯 생성 직후라 아직 DECR을 칠 사용자는 없지만, 재구축이 도는 중이라면 그 결과를
 		// capacity로 덮어써 버리므로 게이트를 잡지 못하면 초기화를 건너뛴다.
-		// (건너뛰어도 재구축이 DB 기준으로 같은 값을 채워 넣는다.)
-		Runnable init = () -> {
+		afterCommitExecutor.execute(() -> {
 			RebuildScope scope = RebuildScope.reservationSlot(slotId);
 			Optional<RebuildLease> lease = rebuildGate.tryBegin(scope);
 			if (lease.isEmpty()) {
@@ -349,56 +351,6 @@ public class PopupStoreHostService {
 					TimeUnit.SECONDS
 				);
 			}
-		};
-		if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-			init.run();
-			return;
-		}
-		TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-			@Override
-			public void afterCommit() {
-				init.run();
-			}
 		});
 	}
-
-	// 트랜잭션 커밋 성공 후에 S3 이미지를 삭제한다. (롤백 시 파일이 사라지는 것을 방지)
-	private void registerAfterCommitDeletion(String key) {
-		if (key == null) {
-			return;
-		}
-		if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-			s3Service.delete(key);
-			return;
-		}
-		TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-			@Override
-			public void afterCommit() {
-				s3Service.delete(key);
-			}
-		});
-	}
-
-	// 트랜잭션 커밋 성공 후에 S3 이미지를 이동한다. (롤백 시 파일 이동 방지)
-	private void registerAfterCommitMove(String srcKey, String destKey) {
-		if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-			try {
-				s3Service.move(srcKey, destKey);
-			} catch (Exception e) {
-				log.error("S3 move 실패 (트랜잭션 외부): srcKey={}, destKey={}", srcKey, destKey, e);
-			}
-			return;
-		}
-		TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-			@Override
-			public void afterCommit() {
-				try {
-					s3Service.move(srcKey, destKey);
-				} catch (Exception e) {
-					log.error("S3 move 실패 (afterCommit): srcKey={}, destKey={}", srcKey, destKey, e);
-				}
-			}
-		});
-	}
-
 }
