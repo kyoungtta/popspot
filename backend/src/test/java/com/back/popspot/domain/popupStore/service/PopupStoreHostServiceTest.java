@@ -16,7 +16,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -41,7 +40,11 @@ import com.back.popspot.global.redis.RedisKeys;
 import com.back.popspot.global.redis.rebuild.RebuildGate;
 import com.back.popspot.global.redis.rebuild.RebuildLease;
 import com.back.popspot.global.redis.rebuild.RebuildScope;
+import com.back.popspot.global.s3.S3AfterCommitExecutor;
 import com.back.popspot.global.s3.S3Service;
+import com.back.popspot.global.transaction.AfterCommitExecutor;
+
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import jakarta.persistence.EntityManager;
 
@@ -83,7 +86,8 @@ class PopupStoreHostServiceTest {
 	@Mock
 	private RebuildGate rebuildGate;
 
-	@InjectMocks
+	// 커밋 이후 실행 로직은 실물을 쓴다 — "커밋 전 미호출 → 커밋 후 호출" 검증이
+	// s3Service mock까지 실제로 흘러가야 의미가 있다. 재시도/메트릭은 각 executor 테스트가 담당.
 	private PopupStoreHostService popupStoreHostService;
 
 	private static final LocalDateTime NOW = LocalDateTime.of(2026, 6, 13, 12, 0);
@@ -93,7 +97,17 @@ class PopupStoreHostServiceTest {
 
 	@BeforeEach
 	void setUp() {
-		// @InjectMocks 가 생성자 주입을 택하면 @PersistenceContext 필드는 주입되지 않으므로 직접 세팅
+		AfterCommitExecutor afterCommitExecutor = new AfterCommitExecutor();
+		popupStoreHostService = new PopupStoreHostService(
+			popupStoreRepository,
+			reservationSlotRepository,
+			s3Service,
+			redisTemplate,
+			rebuildGate,
+			afterCommitExecutor,
+			new S3AfterCommitExecutor(s3Service, afterCommitExecutor, new SimpleMeterRegistry())
+		);
+		// 생성자 주입이므로 @PersistenceContext 필드는 채워지지 않는다 → 직접 세팅
 		ReflectionTestUtils.setField(popupStoreHostService, "entityManager", entityManager);
 		// 슬롯 카운터 초기화는 재구축 게이트를 잡은 뒤에만 실행된다
 		lenient().when(rebuildGate.tryBegin(any())).thenAnswer(invocation ->
