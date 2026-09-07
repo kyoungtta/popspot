@@ -1,0 +1,31 @@
+.git
+.github
+.idea
+.gemini
+.claude
+**/.claude
+**/.idea
+
+# 빌드 산출물 / 로컬 캐시
+**/build
+**/.gradle
+**/bin
+**/out
+
+# 시크릿
+**/.env
+**/*.env
+!.env.example
+
+# 이미지에 필요 없는 디렉터리
+frontend
+terraform
+k6
+load-test
+docs
+postman
+.postman
+*.md
+docker-compose.yml
+prometheus.yml
+dashboard-*.json
