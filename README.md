@@ -112,10 +112,3 @@ CircuitBreaker로 Redis 장애 확산 방지. 대기열은 서버 재기동 시 
 > NBE9-11 팀 프로젝트를 개인적으로 확장한 버전입니다.
 > 원본: https://github.com/prgrms-be-devcourse/NBE9-11-final-Team07
 
-## 개인 확장 작업 (2026.08~)
-| 작업 | PR |
-|---|---|
-| 대기열 Set 정리 race 제거 | #1 |
-| Redis 재구축 게이트 도입 | #2 |
-| 대기열 복구 Lua 원자화 | #3 |
-

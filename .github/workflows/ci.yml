@@ -1,9 +1,13 @@
 name: CI - Test
 on:
   push:
-    branches: [ develop ]
   pull_request:
-    branches: [ main, develop ]
+
+# push와 pull_request가 같은 브랜치에서 동시에 걸리므로, 진행 중인 이전 실행은 취소한다.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -40,7 +44,7 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x backend/gradlew
       - name: Run tests
-        run: ./backend/gradlew -p backend test --info -Dspring.profiles.active=test
+        run: ./backend/gradlew -p backend test -Dspring.profiles.active=test
       - name: Test Report
         uses: dorny/test-reporter@v3
         if: always()

@@ -13,18 +13,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: temurin
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x backend/gradlew
-
-      - name: Build with Gradle
-        run: ./backend/gradlew -p backend clean build -x test
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -38,7 +26,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/jonguk-jeong/popspot:latest
+          tags: ghcr.io/kyoungtta/popspot:${{ github.sha }}
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1
@@ -47,47 +35,37 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u jonguk-jeong --password-stdin
-            docker pull ghcr.io/jonguk-jeong/popspot:latest
+            set -e
 
-            BLUE_RUNNING=$(docker ps -q --filter "name=popspot-blue")
+            IMAGE=ghcr.io/kyoungtta/popspot:${{ github.sha }}
 
-            if [ -n "$BLUE_RUNNING" ]; then
-              TARGET=popspot-green
-              TARGET_PORT=8081
-              OLD=popspot-blue
-            else
-              TARGET=popspot-blue
-              TARGET_PORT=8080
-              OLD=popspot-green
-            fi
+            echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u kyoungtta --password-stdin
+            docker pull $IMAGE
+
+            docker rm -f app || true
 
             docker run -d \
-              --name $TARGET \
+              --name app \
               --restart unless-stopped \
-              -p $TARGET_PORT:8080 \
-              --link redis:redis \
-              --env-file ~/popspot/backend.env \
-              ghcr.io/jonguk-jeong/popspot:latest
+              --network popspot-net \
+              -p 8080:8080 \
+              -e SPRING_PROFILES_ACTIVE=prod \
+              -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/popspot_db?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true" \
+              -e SPRING_DATASOURCE_USERNAME='${{ secrets.DB_USERNAME }}' \
+              -e SPRING_DATASOURCE_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+              -e REDIS_HOST=redis \
+              -e REDIS_PORT=6379 \
+              -e JWT_SECRET='${{ secrets.JWT_SECRET }}' \
+              -e GOOGLE_CLIENT_ID='${{ secrets.GOOGLE_CLIENT_ID }}' \
+              -e GOOGLE_CLIENT_SECRET='${{ secrets.GOOGLE_CLIENT_SECRET }}' \
+              -e AWS_REGION='${{ secrets.AWS_REGION }}' \
+              -e AWS_S3_BUCKET='${{ secrets.AWS_S3_BUCKET }}' \
+              -e AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
+              -e AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
+              -e TOSS_PAYMENTS_CLIENT_KEY='${{ secrets.TOSS_PAYMENTS_CLIENT_KEY }}' \
+              -e TOSS_PAYMENTS_SECRET_KEY='${{ secrets.TOSS_PAYMENTS_SECRET_KEY }}' \
+              $IMAGE
 
-            for i in $(seq 1 12); do
-              STATUS=$(curl -s http://localhost:$TARGET_PORT/actuator/health | grep -o '"status":"UP"')
-              if [ "$STATUS" = '"status":"UP"' ]; then
-                echo "헬스체크 통과"
-                break
-              fi
-              echo "대기 중... ($i/12)"
-              sleep 5
-            done
+            docker image prune -f
 
-            if [ "$STATUS" != '"status":"UP"' ]; then
-              echo "헬스체크 실패 - 롤백"
-              docker rm -f $TARGET
-              exit 1
-            fi
-
-            if [ -n "$(docker ps -q --filter name=$OLD)" ]; then
-              docker rm -f $OLD
-            fi
-
-            echo "배포 완료: $TARGET ($TARGET_PORT)"
+            echo "배포 완료: app ($IMAGE)"
