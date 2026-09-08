@@ -38,17 +38,32 @@ jobs:
             set -e
 
             IMAGE=ghcr.io/kyoungtta/popspot:${{ github.sha }}
+            NGINX_CONF=/etc/nginx/conf.d/popspot.conf
 
             echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u kyoungtta --password-stdin
             docker pull $IMAGE
 
-            docker rm -f app || true
+            # 현재 활성 컨테이너를 보고 배포 대상(비활성 슬롯)을 정한다.
+            if [ -n "$(docker ps -q --filter name=^popspot-blue$)" ]; then
+              TARGET=popspot-green
+              TARGET_PORT=8081
+              OLD=popspot-blue
+            else
+              TARGET=popspot-blue
+              TARGET_PORT=8080
+              OLD=popspot-green
+            fi
+
+            echo "배포 대상: $TARGET ($TARGET_PORT), 기존: $OLD"
+
+            # 이전 배포가 남긴 중지 상태 컨테이너 정리
+            docker rm -f $TARGET || true
 
             docker run -d \
-              --name app \
+              --name $TARGET \
               --restart unless-stopped \
               --network popspot-net \
-              -p 8080:8080 \
+              -p $TARGET_PORT:8080 \
               -e SPRING_PROFILES_ACTIVE=prod \
               -e SPRING_DATASOURCE_URL="jdbc:mysql://mysql:3306/popspot_db?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true" \
               -e SPRING_DATASOURCE_USERNAME='${{ secrets.DB_USERNAME }}' \
@@ -66,6 +81,52 @@ jobs:
               -e TOSS_PAYMENTS_SECRET_KEY='${{ secrets.TOSS_PAYMENTS_SECRET_KEY }}' \
               $IMAGE
 
+            # 헬스체크: 5초 간격 12회 (최대 60초)
+            HEALTHY=0
+            for i in $(seq 1 12); do
+              STATUS=$(curl -s http://localhost:$TARGET_PORT/actuator/health | grep -o '"status":"UP"' || true)
+              if [ "$STATUS" = '"status":"UP"' ]; then
+                HEALTHY=1
+                echo "헬스체크 통과 ($i/12)"
+                break
+              fi
+              echo "대기 중... ($i/12)"
+              sleep 5
+            done
+
+            if [ "$HEALTHY" != "1" ]; then
+              echo "헬스체크 실패 - 새 컨테이너만 제거하고 롤백 (기존 $OLD 와 nginx 설정은 유지)"
+              docker logs --tail 50 $TARGET || true
+              docker rm -f $TARGET || true
+              exit 1
+            fi
+
+            # nginx upstream 포트를 새 컨테이너 포트로 교체
+            sudo cp $NGINX_CONF ${NGINX_CONF}.bak
+            sudo sed -i -E "s|(server[[:space:]]+[^:;[:space:]]+:)[0-9]+|\1$TARGET_PORT|" $NGINX_CONF
+
+            # 치환이 실제로 됐는지 확인 (실패 시 구 컨테이너로 트래픽이 남은 채 배포가 끝나는 것을 막는다)
+            if ! grep -qE "server[[:space:]]+[^:;[:space:]]+:$TARGET_PORT" $NGINX_CONF; then
+              echo "nginx upstream 포트 치환 실패 - 설정 복구 후 롤백"
+              sudo cp ${NGINX_CONF}.bak $NGINX_CONF
+              docker rm -f $TARGET || true
+              exit 1
+            fi
+
+            if ! sudo nginx -t; then
+              echo "nginx 설정 검증 실패 - 설정 복구 후 롤백"
+              sudo cp ${NGINX_CONF}.bak $NGINX_CONF
+              docker rm -f $TARGET || true
+              exit 1
+            fi
+
+            sudo nginx -s reload
+
+            # 트래픽 전환 완료 후 이전 컨테이너 제거
+            if [ -n "$(docker ps -aq --filter name=^${OLD}$)" ]; then
+              docker rm -f $OLD
+            fi
+
             docker image prune -f
 
-            echo "배포 완료: app ($IMAGE)"
+            echo "배포 완료: $TARGET ($TARGET_PORT)"
