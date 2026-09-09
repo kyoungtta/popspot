@@ -1,15 +1,21 @@
-.terraform/
+# state (원격 S3에 저장되지만 로컬 캐시/백업이 생길 수 있음)
 *.tfstate
-*.tfstate.backup
+*.tfstate.*
+.terraform/
 .terraform.tfstate.lock.info
-terraform.tfvars
+
+# 비밀값 포함
 *.tfvars
-.terraform.lock.hcl
+!*.tfvars.example
+backend.hcl
+
+# 기타
 crash.log
 crash.*.log
 *.tfplan
+tfplan*
+*.pem
 override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
-*.pem

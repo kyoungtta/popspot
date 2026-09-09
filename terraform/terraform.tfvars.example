@@ -1,0 +1,30 @@
+# 이 파일을 terraform.tfvars 로 복사한 뒤 값을 채운다.
+# terraform.tfvars 는 .gitignore 대상이다 (DB 비밀번호가 들어감).
+
+##############################################
+# 필수 — 기본값이 없어 반드시 지정해야 하는 값
+##############################################
+
+# 개인 AWS 계정에 미리 만들어 둔 EC2 키페어 이름 (.pem 확장자 제외)
+key_pair_name = "popspot-key"
+
+# 앱이 쓸 MySQL 유저 비밀번호 (8자 이상)
+# SSM SecureString에 저장되고, EC2가 부팅 시 IAM 역할로 꺼내 간다.
+db_password = "CHANGE-ME"
+
+##############################################
+# 선택 — 기본값을 바꾸고 싶을 때만
+##############################################
+
+# aws_region        = "ap-northeast-2"
+# project_name      = "popspot"
+# ec2_instance_type = "t3.small"   # 블루/그린이 빠듯하면 t3.medium
+
+# S3 버킷 이름. 지정하지 않으면 popspot-images-<계정ID> 로 자동 생성된다.
+# s3_bucket_name = "my-popspot-images"
+
+# 프론트엔드 Origin (Presigned PUT preflight 허용 대상)
+# s3_cors_allowed_origins = ["https://my-frontend.vercel.app", "http://localhost:3000"]
+
+# MySQL 데이터 볼륨 크기(GB). 인스턴스와 분리되어 있어 교체해도 남는다.
+# mysql_data_volume_size = 20

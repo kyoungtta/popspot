@@ -1,0 +1,194 @@
+#!/bin/bash
+# EC2 최초 부팅 시 1회 실행된다. 로그: /var/log/cloud-init-output.log
+#
+# 주의: user_data는 provider v6부터 state에 평문으로 저장되고 EC2 API로도 읽힌다.
+# 비밀값을 직접 쓰지 말 것. DB 비밀번호는 아래에서 SSM으로 꺼낸다.
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y ca-certificates curl gnupg unzip nginx fail2ban
+
+# ─── AWS CLI ─────────────────────────────────────────────────────────────────
+# Ubuntu 24.04 아카이브에는 awscli 패키지가 없다(apt로 설치 불가).
+# AWS 공식 설치 프로그램을 쓴다. 인스턴스 아키텍처에 맞춰 받는다.
+ARCH=$(uname -m) # x86_64 (t3 계열) 또는 aarch64 (t4g 계열)
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$ARCH.zip" -o /tmp/awscliv2.zip
+rm -rf /tmp/aws
+unzip -qo /tmp/awscliv2.zip -d /tmp
+# 이 스크립트를 다시 돌릴 수도 있으므로(수정본 수동 실행 등) 기존 설치가 있으면 --update.
+if command -v aws >/dev/null 2>&1; then
+  /tmp/aws/install --update
+else
+  /tmp/aws/install
+fi
+rm -rf /tmp/awscliv2.zip /tmp/aws
+aws --version
+
+# ─── SSH 하드닝 ──────────────────────────────────────────────────────────────
+# 22번이 인터넷에 열려 있으므로(CD 러너가 접속해야 함) 키 인증만 허용하고
+# 무차별 대입 시도를 차단한다.
+cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'SSHD'
+PasswordAuthentication no
+PermitRootLogin no
+KbdInteractiveAuthentication no
+SSHD
+
+# 설정이 잘못되면 재시작 후 SSH가 죽는다. 먼저 검증한다.
+# Ubuntu 24.04는 ssh를 소켓 활성화로 쓴다. sshd가 아직 한 번도 뜨지 않은 이 시점에는
+# systemd가 만들어 주는 /run/sshd 가 없어서 sshd -t 가 실패한다. 먼저 만들어 둔다.
+mkdir -p /run/sshd
+sshd -t
+systemctl restart ssh
+
+# 기본 sshd jail은 /var/log/auth.log를 보는데 Ubuntu 24.04는 journald만 쓴다.
+cat > /etc/fail2ban/jail.local <<'F2B'
+[sshd]
+enabled  = true
+backend  = systemd
+maxretry = 5
+bantime  = 1h
+F2B
+systemctl enable --now fail2ban
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+# ─── MySQL 데이터 볼륨 마운트 ─────────────────────────────────────────────────
+# Nitro 인스턴스는 /dev/sdf 가 /dev/nvme?n1 으로 바뀌어 번호를 예측할 수 없다.
+# 볼륨 ID로 만들어지는 by-id 심볼릭 링크를 쓰면 확실하다.
+DATA_DEVICE="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${mysql_volume_id_nodash}"
+
+# attach가 끝나기 전에 부팅이 진행될 수 있으므로 장치가 보일 때까지 기다린다.
+DATA_READY=0
+for i in $(seq 1 30); do
+  if [ -e "$DATA_DEVICE" ]; then DATA_READY=1; break; fi
+  echo "데이터 볼륨 대기 중... ($i/30)"
+  sleep 2
+done
+
+# 기다려도 안 붙었으면 여기서 멈춘다. 그냥 진행하면 mkfs가 엉뚱하게 실패해
+# 원인 파악이 어려워진다.
+if [ "$DATA_READY" != "1" ]; then
+  echo "데이터 볼륨($DATA_DEVICE)이 나타나지 않았습니다. 볼륨 연결 상태를 확인하세요." >&2
+  exit 1
+fi
+
+# 새 볼륨이면 파일시스템이 없다. 이미 데이터가 있으면 절대 포맷하지 않는다.
+if ! blkid "$DATA_DEVICE"; then
+  echo "빈 볼륨 - ext4 생성"
+  mkfs -t ext4 "$DATA_DEVICE"
+fi
+
+mkdir -p /data
+# 재부팅 후에도 붙도록 UUID로 fstab에 등록한다 (nofail: 볼륨이 없어도 부팅은 되게)
+DATA_UUID=$(blkid -s UUID -o value "$DATA_DEVICE")
+grep -q "$DATA_UUID" /etc/fstab || echo "UUID=$DATA_UUID /data ext4 defaults,nofail 0 2" >> /etc/fstab
+mount -a
+mkdir -p /data/mysql
+
+# ─── 앱 네트워크 ──────────────────────────────────────────────────────────────
+# deploy.yml의 --network 값과 반드시 일치해야 한다.
+docker network create ${docker_network} 2>/dev/null || true
+
+# ─── MySQL ───────────────────────────────────────────────────────────────────
+# 비밀번호를 인스턴스 IAM 역할로 SSM에서 꺼낸다 (user_data에 평문으로 남기지 않기 위해).
+# IAM 역할 정책은 붙은 직후 몇 초간 전파되지 않을 수 있어 재시도한다.
+DB_PASSWORD=""
+for i in $(seq 1 10); do
+  if DB_PASSWORD=$(aws ssm get-parameter \
+      --name "${db_password_param}" \
+      --with-decryption \
+      --region ${aws_region} \
+      --query 'Parameter.Value' \
+      --output text 2>/dev/null); then
+    break
+  fi
+  echo "SSM 파라미터 조회 재시도... ($i/10)"
+  sleep 5
+done
+
+if [ -z "$DB_PASSWORD" ]; then
+  echo "DB 비밀번호를 SSM에서 가져오지 못했습니다" >&2
+  exit 1
+fi
+
+# 호스트 포트를 열지 않는다. popspot-net 안의 컨테이너만 접근할 수 있다.
+# MYSQL_RANDOM_ROOT_PASSWORD: root 비밀번호를 우리가 관리하지 않아도 되게 한다.
+#   (필요하면 docker logs mysql 첫 부분에 1회 출력된 값을 확인)
+docker rm -f mysql 2>/dev/null || true
+docker run -d \
+  --name mysql \
+  --restart unless-stopped \
+  --network ${docker_network} \
+  -v /data/mysql:/var/lib/mysql \
+  -e MYSQL_RANDOM_ROOT_PASSWORD=yes \
+  -e MYSQL_DATABASE=${db_name} \
+  -e MYSQL_USER=${db_username} \
+  -e MYSQL_PASSWORD="$DB_PASSWORD" \
+  ${mysql_image}
+
+unset DB_PASSWORD
+
+# ─── Redis ───────────────────────────────────────────────────────────────────
+# 앱은 REDIS_HOST=redis 로 접속하므로 컨테이너 이름이 redis 여야 한다.
+docker rm -f redis 2>/dev/null || true
+docker run -d \
+  --name redis \
+  --restart unless-stopped \
+  --network ${docker_network} \
+  ${redis_image}
+
+# ─── Nginx ───────────────────────────────────────────────────────────────────
+# deploy.yml이 배포 때마다 upstream의 포트를 sed로 교체한다.
+# "server 127.0.0.1:<포트>;" 형식을 유지해야 그 sed가 동작한다.
+cat > /etc/nginx/conf.d/popspot.conf <<'NGINX'
+upstream popspot {
+    server 127.0.0.1:8080;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    # Presigned URL을 쓰므로 본문이 클 일은 없지만 여유를 둔다.
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass http://popspot;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    60s;
+    }
+}
+NGINX
+
+# 기본 사이트가 80 default_server를 선점해 충돌하므로 제거한다.
+rm -f /etc/nginx/sites-enabled/default
+
+nginx -t
+systemctl enable nginx
+# reload는 nginx가 이미 떠 있어야만 동작한다. restart가 두 경우 모두 안전하다.
+systemctl restart nginx
+
+echo "user_data 완료"

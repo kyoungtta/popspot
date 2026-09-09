@@ -1,0 +1,10 @@
+# terraform/bootstrap apply 후 `terraform -chdir=terraform/bootstrap output backend_hcl`
+# 의 출력을 backend.hcl 로 저장한 뒤 아래처럼 init 한다.
+#
+#   terraform init -backend-config=backend.hcl
+
+bucket       = "popspot-tfstate-<AWS-계정ID>"
+key          = "popspot/terraform.tfstate"
+region       = "ap-northeast-2"
+encrypt      = true
+use_lockfile = true
