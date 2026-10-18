@@ -8,7 +8,7 @@ const DURATION = __ENV.DURATION || '60s';
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 
 // DB에 실제로 있는 팝업 id로 바꿔야 함
-const POPUP_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const POPUP_IDS = [1, 2, 3, 900000];
 
 export const options = {
     scenarios: {
