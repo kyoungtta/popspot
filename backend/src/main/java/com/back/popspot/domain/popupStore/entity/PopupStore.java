@@ -84,13 +84,7 @@ public class PopupStore extends BaseEntity {
 	 * </ul>
 	 */
 	public PopupStatus calculateStatus(LocalDateTime now) {
-		if (reservationStartAt.isAfter(now)) {
-			return PopupStatus.UPCOMING;
-		}
-		if (reservationEndAt.isAfter(now)) {
-			return PopupStatus.OPEN;
-		}
-		return PopupStatus.CLOSED;
+		return PopupStatus.calculate(reservationStartAt, reservationEndAt, now);
 	}
 
 	// 부분 수정용 - 호출 측에서 null 검사 후 필요한 필드만 호출한다.
