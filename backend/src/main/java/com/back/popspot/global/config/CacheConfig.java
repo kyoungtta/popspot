@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.cache.RedisCacheConfiguration;
 import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.cache.RedisCacheWriter;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.serializer.JacksonJsonRedisSerializer;
 import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
@@ -37,9 +38,17 @@ public class CacheConfig implements CachingConfigurer {
 			.serializeValuesWith(SerializationPair.fromSerializer(
 				new JacksonJsonRedisSerializer<>(PopupStoreDetailCache.class)));
 
-		return RedisCacheManager.builder(redisConnectionFactory)
+		// Spring Data Redis 4 의 기본 cache writer 는 put/evict 를 비동기로 보내 메서드 반환 시점에 반영이 보장되지 않는다.
+		// 수정 직후 조회가 이전 값을 읽지 않도록 쓰기를 동기로 고정한다.
+		RedisCacheWriter cacheWriter = RedisCacheWriter.create(redisConnectionFactory,
+			configurer -> configurer.immediateWrites());
+
+		return RedisCacheManager.builder(cacheWriter)
 			.withCacheConfiguration(POPUP_DETAIL, popupDetailConfig)
 			.disableCreateOnMissingCache()
+			// 트랜잭션 안의 put/evict 를 커밋 이후로 미룬다. @CacheEvict 가 커밋 전에 실행되면
+			// 그 사이 조회가 커밋 전 DB 값을 다시 캐시에 채울 수 있다.
+			.transactionAware()
 			.build();
 	}
 
