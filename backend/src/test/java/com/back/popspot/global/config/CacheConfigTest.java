@@ -10,6 +10,8 @@ import java.time.LocalDateTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.cache.Cache;
+import org.springframework.cache.transaction.TransactionAwareCacheDecorator;
 import org.springframework.data.redis.cache.RedisCache;
 import org.springframework.data.redis.cache.RedisCacheManager;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
@@ -30,10 +32,17 @@ class CacheConfigTest {
 		cacheManager.afterPropertiesSet();
 	}
 
+	// transactionAware 매니저는 캐시를 TransactionAwareCacheDecorator 로 감싸서 반환한다
+	private RedisCache popupDetailCache() {
+		Cache cache = cacheManager.getCache(CacheConfig.POPUP_DETAIL);
+		assertThat(cache).isInstanceOf(TransactionAwareCacheDecorator.class);
+		return (RedisCache)((TransactionAwareCacheDecorator)cache).getTargetCache();
+	}
+
 	@Test
 	@DisplayName("popupDetail 캐시는 TTL 10분이 적용된다")
 	void popupDetail_ttlIsTenMinutes() {
-		RedisCache cache = (RedisCache)cacheManager.getCache(CacheConfig.POPUP_DETAIL);
+		RedisCache cache = popupDetailCache();
 
 		assertThat(cache.getCacheConfiguration().getTtlFunction()
 				.getTimeToLive(1L, null)).hasMinutes(10);
@@ -42,7 +51,7 @@ class CacheConfigTest {
 	@Test
 	@DisplayName("LocalDateTime 을 포함한 스냅샷이 JSON 으로 저장되고 그대로 복원된다")
 	void popupDetail_serializesToJsonAndRestores() {
-		RedisCache cache = (RedisCache)cacheManager.getCache(CacheConfig.POPUP_DETAIL);
+		RedisCache cache = popupDetailCache();
 		var valuePair = cache.getCacheConfiguration().getValueSerializationPair();
 		PopupStoreDetailCache original = new PopupStoreDetailCache(1L, "title", "location", "image", "설명",
 				PopupFeeType.PAID, 10000, LocalDateTime.of(2026, 6, 1, 10, 0, 30), LocalDateTime.of(2026, 6, 10, 18, 0),

@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,6 +25,7 @@ import com.back.popspot.domain.popupStore.entity.ReservationSlot;
 import com.back.popspot.domain.popupStore.repository.PopupStoreRepository;
 import com.back.popspot.domain.popupStore.repository.ReservationSlotRepository;
 import com.back.popspot.domain.user.entity.User;
+import com.back.popspot.global.config.CacheConfig;
 import com.back.popspot.global.exception.BusinessException;
 import com.back.popspot.global.exception.ErrorCode;
 import com.back.popspot.global.redis.RedisKeys;
@@ -106,7 +108,9 @@ public class PopupStoreHostService {
 	 * 팝업스토어를 부분 수정한다. (주최자, 소유자만)
 	 * 없으면 RESOURCE_NOT_FOUND, 소유자가 아니면 FORBIDDEN.
 	 * null 이 아닌 필드만 반영하며, dirty checking 으로 자동 저장된다.
+	 * 성공 시 popupDetail 캐시를 비운다 (캐시 매니저가 transactionAware 라 커밋 이후에 삭제된다).
 	 */
+	@CacheEvict(cacheNames = CacheConfig.POPUP_DETAIL, key = "#popupStoreId")
 	@Transactional
 	public void updatePopupStore(Long userId, Long popupStoreId, PopupStoreUpdateRequest request) {
 		PopupStore popupStore = popupStoreRepository.findById(popupStoreId)
@@ -182,7 +186,9 @@ public class PopupStoreHostService {
 	 * 팝업스토어를 삭제한다. (주최자, 소유자만)
 	 * 없으면 RESOURCE_NOT_FOUND, 소유자가 아니면 FORBIDDEN,
 	 * 운영 시작일(openDate) 이후면 INVALID_INPUT_VALUE.
+	 * 성공 시 popupDetail 캐시를 비운다 (커밋 이후 삭제).
 	 */
+	@CacheEvict(cacheNames = CacheConfig.POPUP_DETAIL, key = "#popupStoreId")
 	@Transactional
 	public void deletePopupStore(Long userId, Long popupStoreId) {
 		PopupStore popupStore = popupStoreRepository.findById(popupStoreId)
