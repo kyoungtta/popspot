@@ -8,9 +8,11 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.back.popspot.domain.popupStore.dto.PopupImagePresignResponse;
+import com.back.popspot.domain.popupStore.dto.PopupStoreDetailCache;
 import com.back.popspot.domain.popupStore.dto.PopupStoreDetailResponse;
 import com.back.popspot.domain.popupStore.dto.PopupStoreListResponse;
 import com.back.popspot.domain.popupStore.dto.ReservationSlotResponse;
@@ -35,6 +37,7 @@ PopupStoreService {
 	private final ReservationSlotRepository reservationSlotRepository;
 	private final S3Service s3Service;
 	private final RedisTemplate<String, Long> redisTemplate;
+	private final PopupStoreDetailReader popupStoreDetailReader;
 
 	/**
 	 * 팝업스토어 목록을 조회한다.
@@ -53,14 +56,15 @@ PopupStoreService {
 
 	/**
 	 * 팝업스토어 단건 상세 조회. 없으면 RESOURCE_NOT_FOUND.
-	 * status 는 조회 시점 기준으로 계산해 응답에 담는다.
+	 * 팝업 정보는 popupDetail 캐시에서 읽고, status 와 presigned imageUrl 은 조회 시점 기준으로 매번 계산한다.
+	 * 캐시 hit 시 DB 커넥션을 잡지 않도록 클래스 레벨 readOnly 트랜잭션을 SUPPORTS 로 덮어쓴다.
 	 */
+	@Transactional(propagation = Propagation.SUPPORTS)
 	public PopupStoreDetailResponse getPopupStore(Long popupStoreId) {
-		PopupStore popupStore = popupStoreRepository.findById(popupStoreId)
-			.orElseThrow(() -> new BusinessException(ErrorCode.RESOURCE_NOT_FOUND));
+		PopupStoreDetailCache popupStore = popupStoreDetailReader.read(popupStoreId);
 
 		PopupStatus status = popupStore.calculateStatus(LocalDateTime.now());
-		return PopupStoreDetailResponse.from(popupStore, status, presignedImageUrl(popupStore.getImageKey()));
+		return PopupStoreDetailResponse.from(popupStore, status, presignedImageUrl(popupStore.imageKey()));
 	}
 
 	// imageKey 로 presigned GET URL 발급 (없으면 null)
