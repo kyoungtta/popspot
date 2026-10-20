@@ -11,7 +11,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
-import java.util.Optional;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -27,6 +26,7 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import com.back.popspot.domain.popupStore.dto.PopupStoreDetailCache;
 import com.back.popspot.domain.popupStore.dto.PopupStoreDetailResponse;
 import com.back.popspot.domain.popupStore.dto.PopupStoreListResponse;
 import com.back.popspot.domain.popupStore.dto.ReservationSlotResponse;
@@ -62,6 +62,9 @@ class PopupStoreServiceTest {
 
 	@Mock
 	private ValueOperations<String, Long> valueOperations;
+
+	@Mock
+	private PopupStoreDetailReader popupStoreDetailReader;
 
 	@InjectMocks
 	private PopupStoreService popupStoreService;
@@ -125,7 +128,8 @@ class PopupStoreServiceTest {
 		ReflectionTestUtils.setField(openPopup, "description", "설명");
 		ReflectionTestUtils.setField(openPopup, "feeType", PopupFeeType.PAID);
 		ReflectionTestUtils.setField(openPopup, "price", 10000);
-		when(popupStoreRepository.findById(10L)).thenReturn(Optional.of(openPopup));
+		when(popupStoreDetailReader.read(10L)).thenReturn(PopupStoreDetailCache.from(openPopup));
+		when(s3Service.generatePresignedGetUrl("image10")).thenReturn("https://s3/presigned/image10");
 
 		PopupStoreDetailResponse response = popupStoreService.getPopupStore(10L);
 
@@ -135,12 +139,13 @@ class PopupStoreServiceTest {
 		assertThat(response.feeType()).isEqualTo(PopupFeeType.PAID);
 		assertThat(response.price()).isEqualTo(10000);
 		assertThat(response.status()).isEqualTo(PopupStatus.OPEN);
+		assertThat(response.imageUrl()).isEqualTo("https://s3/presigned/image10");
 	}
 
 	@Test
 	@DisplayName("상세 조회: 존재하지 않으면 RESOURCE_NOT_FOUND 예외")
 	void getPopupStore_notFound_throwsBusinessException() {
-		when(popupStoreRepository.findById(99L)).thenReturn(Optional.empty());
+		when(popupStoreDetailReader.read(99L)).thenThrow(new BusinessException(ErrorCode.RESOURCE_NOT_FOUND));
 
 		assertThatThrownBy(() -> popupStoreService.getPopupStore(99L))
 				.isInstanceOf(BusinessException.class)
